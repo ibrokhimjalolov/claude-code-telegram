@@ -1,0 +1,8 @@
+# Dependencies (recreated by `bun install`)
+node_modules/
+
+# Logs
+*.log
+
+# OS / editor cruft
+.DS_Store
