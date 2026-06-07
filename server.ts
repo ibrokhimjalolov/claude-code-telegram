@@ -53,20 +53,27 @@ if (!TOKEN) {
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
-// Telegram allows exactly one getUpdates consumer per token. If a previous
-// session crashed (SIGKILL, terminal closed) its server.ts grandchild can
-// survive as an orphan and hold the slot forever, so every new session sees
-// 409 Conflict. Kill any stale holder before we start polling.
+// Telegram allows exactly one getUpdates consumer per token, so instances
+// coordinate through bot.pid: whoever's pid is in the file is the primary
+// poller. A new instance does NOT evict a live primary — it stands by (see the
+// poll lifecycle near the bottom) and takes over only if the primary exits.
+// The pid in the file is written when an instance claims the slot, not at boot.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+
+// The live primary's pid, or null if the slot is free. Returns null when the
+// file is missing, holds our own pid, or names a process that no longer exists
+// (a primary SIGKILLed without cleanup leaves a stale pid that fails this probe
+// and is treated as free).
+function activePoller(): number | null {
+  try {
+    const pid = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (pid > 1 && pid !== process.pid) {
+      process.kill(pid, 0) // signal 0 = liveness probe; throws ESRCH if gone
+      return pid
+    }
+  } catch {}
+  return null
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -991,51 +998,93 @@ bot.catch(err => {
   process.stderr.write(`telegram channel: handler error (polling continues): ${err.error}\n`)
 })
 
-// Retry polling with backoff on any error. Previously only 409 was retried —
-// a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
-// returned, and polling stopped permanently while the process stayed alive
-// (MCP stdin keeps it running). Outbound tools kept working but the bot was
-// deaf to inbound messages until a full restart.
+// Poll lifecycle: stand by until the token's getUpdates slot is free, claim it,
+// then poll. This is what lets a second `bun server.ts` start in another
+// terminal WITHOUT stopping the first — the newcomer sees the primary's live
+// pid and stands by instead of taking over. It promotes itself to primary only
+// when the primary exits (clean shutdown) or dies (stale pid), so the channel
+// never goes permanently dark. Standby instances never touch Telegram polling;
+// their outbound tools (reply/react/edit) still work, but inbound messages are
+// delivered to whichever instance currently holds the slot.
+const STANDBY_INTERVAL_MS = 5000
+
 void (async () => {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      await bot.start({
-        onStart: info => {
-          attempt = 0
-          botUsername = info.username
-          process.stderr.write(`telegram channel: polling as @${info.username}\n`)
-          void bot.api.setMyCommands(
-            [
-              { command: 'start', description: 'Welcome and setup guide' },
-              { command: 'help', description: 'What this bot can do' },
-              { command: 'status', description: 'Check your pairing status' },
-            ],
-            { scope: { type: 'all_private_chats' } },
-          ).catch(() => {})
-        },
-      })
-      return // bot.stop() was called — clean exit from the loop
-    } catch (err) {
-      if (shuttingDown) return
-      // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
-      if (err instanceof Error && err.message === 'Aborted delay') return
-      const is409 = err instanceof GrammyError && err.error_code === 409
-      // Never give up. A persistent 409 means another process holds the single
-      // getUpdates slot (a stray 'bun server.ts' or a second session) — but the
-      // instant that holder exits, the next attempt connects and the bot is live
-      // again, no restart needed. Restarting *this* process can't help: it's a
-      // stdio channel, so the OS process IS the MCP connection to Claude Code —
-      // killing it tears down the channel and Claude Code won't re-spawn it.
-      // Healing in place is the only recovery that keeps the channel attached.
-      // Back off harder once a 409 has persisted so two live sessions don't
-      // hammer Telegram while one waits for the other to go away.
-      const cap = is409 && attempt > 8 ? 60000 : 15000
-      const delay = Math.min(1000 * attempt, cap)
-      const detail = is409
-        ? `409 Conflict (attempt ${attempt})${attempt === 1 ? ' — another instance is polling (zombie session, or a second Claude Code running?)' : ''}`
-        : `polling error: ${err}`
-      process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
-      await new Promise(r => setTimeout(r, delay))
+  let standbyPid = -1 // last pid we logged a standby notice for — avoids spam
+  for (;;) {
+    if (shuttingDown) return
+
+    // Another live instance owns the slot — wait, don't poll.
+    const holder = activePoller()
+    if (holder != null) {
+      if (standbyPid !== holder) {
+        process.stderr.write(
+          `telegram channel: another poller is live (pid=${holder}) — standing by, not polling. Will take over only if it exits.\n`,
+        )
+        standbyPid = holder
+      }
+      await new Promise(r => setTimeout(r, STANDBY_INTERVAL_MS))
+      continue
     }
+    standbyPid = -1
+
+    // Slot is free — claim it and become the primary poller.
+    writeFileSync(PID_FILE, String(process.pid))
+    process.stderr.write('telegram channel: slot free — claiming as primary poller\n')
+
+    // Retry polling with backoff on any error. Previously only 409 was retried —
+    // a single ETIMEDOUT/ECONNRESET/DNS failure rejected bot.start(), the catch
+    // returned, and polling stopped permanently while the process stayed alive
+    // (MCP stdin keeps it running). Outbound tools kept working but the bot was
+    // deaf to inbound messages until a full restart.
+    let yieldToOther = false
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await bot.start({
+          onStart: info => {
+            attempt = 0
+            botUsername = info.username
+            process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+            void bot.api.setMyCommands(
+              [
+                { command: 'start', description: 'Welcome and setup guide' },
+                { command: 'help', description: 'What this bot can do' },
+                { command: 'status', description: 'Check your pairing status' },
+              ],
+              { scope: { type: 'all_private_chats' } },
+            ).catch(() => {})
+          },
+        })
+        return // bot.stop() was called — clean exit from the lifecycle
+      } catch (err) {
+        if (shuttingDown) return
+        // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
+        if (err instanceof Error && err.message === 'Aborted delay') return
+        const is409 = err instanceof GrammyError && err.error_code === 409
+        if (is409 && activePoller() != null) {
+          // Lost a startup race: another live instance grabbed the slot and
+          // recorded its pid. Yield and return to standby behind it rather than
+          // fight — two pollers flip-flopping the slot would split inbound
+          // messages between sessions.
+          process.stderr.write('telegram channel: 409 Conflict — another instance won the slot, standing by\n')
+          yieldToOther = true
+          break
+        }
+        // 409 with no pid-file owner (a stray poller, a different state dir, or a
+        // leftover webhook) or a transient network/DNS error: retry in place,
+        // never give up. The instant the conflict clears, the next attempt
+        // connects and the bot is live again — no restart needed. Restarting
+        // *this* process can't help anyway: it's a stdio channel, so the OS
+        // process IS the MCP connection to Claude Code. Back off harder on a
+        // persistent 409 so uncoordinated pollers don't hammer Telegram.
+        const cap = is409 && attempt > 8 ? 60000 : 15000
+        const delay = Math.min(1000 * attempt, cap)
+        const detail = is409
+          ? `409 Conflict (attempt ${attempt}) — another poller holds the token (stray process or a different state dir)`
+          : `polling error: ${err}`
+        process.stderr.write(`telegram channel: ${detail}, retrying in ${delay / 1000}s\n`)
+        await new Promise(r => setTimeout(r, delay))
+      }
+    }
+    if (yieldToOther) continue // back to the standby check
   }
 })()
