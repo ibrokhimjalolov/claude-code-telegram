@@ -7,6 +7,7 @@ The MCP server logs into Telegram as a bot and provides tools to Claude to reply
 ## Prerequisites
 
 - [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
+- Claude Code **v2.1.80+** — channels are a research preview (v2.1.81+ for the permission relay). On org-managed setups, an admin may need to enable channels before `--channels` works.
 
 ## Quick Setup
 > Default pairing flow for a single-user DM bot. See [ACCESS.md](./ACCESS.md) for groups and multi-user setups.
@@ -24,9 +25,10 @@ BotFather replies with a token that looks like `123456789:AAHfiqksKZ8...` — th
 
 These are Claude Code commands — run `claude` to start a session first.
 
-Install the plugin:
+Add this repo as a marketplace, then install the plugin:
 ```
-/plugin install telegram@claude-plugins-official
+/plugin marketplace add ibrokhimjalolov/claude-code-telegram
+/plugin install telegram@claude-code-telegram
 /reload-plugins
 ```
 
@@ -45,7 +47,7 @@ Writes `TELEGRAM_BOT_TOKEN=...` to `~/.claude/channels/telegram/.env`. You can a
 The server won't connect without this — exit your session and start a new one:
 
 ```sh
-claude --channels plugin:telegram@claude-plugins-official
+claude --channels plugin:telegram@claude-code-telegram
 ```
 
 **5. Pair.**
